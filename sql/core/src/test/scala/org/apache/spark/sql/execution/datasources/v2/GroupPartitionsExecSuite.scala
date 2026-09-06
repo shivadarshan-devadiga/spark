@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources.v2
 
+import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, AttributeReference, SortOrder, TransformExpression}
@@ -26,13 +27,14 @@ import org.apache.spark.sql.connector.catalog.functions.{BucketFunction, BucketR
 import org.apache.spark.sql.execution.{DummySparkPlan, LeafExecNode, SafeForKWayMerge}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.{IntegerType, LongType}
 
 class GroupPartitionsExecSuite extends SharedSparkSession {
 
   private val exprA = AttributeReference("a", IntegerType)()
   private val exprB = AttributeReference("b", IntegerType)()
   private val exprC = AttributeReference("c", IntegerType)()
+  private val exprLong = AttributeReference("l", LongType)()
 
   private def row(a: Int): InternalRow = InternalRow.fromSeq(Seq(a))
   private def row(a: Int, b: Int): InternalRow = InternalRow.fromSeq(Seq(a, b))
@@ -342,6 +344,63 @@ class GroupPartitionsExecSuite extends SharedSparkSession {
         joinKeyPositions = spec.joinKeyPositions)
       assert(gpe.groupedPartitions.map(_._1) === spec.partitioning.partitionKeys)
     }
+  }
+
+  test("SPARK-59234: a distributing node catches an expected partition key count " +
+      "below its splits") {
+    // Key 1 holds two of the child's splits. `distributePartitions` lays those splits out over the
+    // count the two sides agreed on for the key, so a count of 1 does not describe this side: the
+    // padding is a no-op and the key would contribute two partitions while the replicating side
+    // contributes one, leaving the sides misaligned. The node has to catch that itself, since the
+    // count is derived from the other side's view of this one.
+    val child = DummySparkPlan(
+      outputPartitioning = KeyedPartitioning(Seq(exprA), Seq(row(1), row(2), row(1))))
+    def gpe(numSplitsForKey1: Int, distribute: Boolean): GroupPartitionsExec =
+      GroupPartitionsExec(
+        child,
+        expectedPartitionKeys = Some(Seq(
+          InternalRowComparableWrapper(row(1), Seq(exprA)) -> numSplitsForKey1,
+          InternalRowComparableWrapper(row(2), Seq(exprA)) -> 1)),
+        distributePartitions = distribute)
+
+    val e = intercept[SparkException](gpe(1, distribute = true).groupedPartitions)
+    assert(e.getCondition === "INTERNAL_ERROR")
+    assert(e.getMessage.contains("expected at most 1 partition(s)"))
+    assert(e.getMessage.contains("has 2 splits"))
+
+    // A count that covers the splits is laid out as before: one split per partition, and a count
+    // above the splits pads with empty partitions.
+    assert(gpe(2, distribute = true).groupedPartitions.map(_._2) === Seq(Seq(0), Seq(2), Seq(1)))
+    assert(gpe(3, distribute = true).groupedPartitions.map(_._2) ===
+      Seq(Seq(0), Seq(2), Seq.empty, Seq(1)))
+
+    // The replicating layout emits exactly the expected count for a key whatever its splits are,
+    // so the check does not apply to it.
+    assert(gpe(1, distribute = false).groupedPartitions.map(_._2) === Seq(Seq(0, 2), Seq(1)))
+  }
+
+  test("SPARK-59234: a node catches expected partition keys that are not typed like its own") {
+    // The child's keys are Integer rows, so expected keys typed Long are looked up among them by an
+    // equality that answers false on the types alone. Every key would miss and every partition
+    // would come out empty, with no error and no rows.
+    val child = DummySparkPlan(
+      outputPartitioning = KeyedPartitioning(Seq(exprA), Seq(row(1), row(2))))
+    val longKey = InternalRowComparableWrapper(InternalRow.fromSeq(Seq(1L)), Seq(exprLong))
+    val e = intercept[SparkException] {
+      GroupPartitionsExec(child, expectedPartitionKeys = Some(Seq(longKey -> 1))).groupedPartitions
+    }
+    assert(e.getCondition === "INTERNAL_ERROR")
+    assert(e.getMessage.contains(s"expected partition keys typed [${IntegerType.simpleString}]"))
+    assert(e.getMessage.contains(s"they are typed [${LongType.simpleString}]"))
+
+    // A side that holds no key is not asked: `keyDataTypes` has no key row to report and falls back
+    // to the expression types, which a reduce below would leave unrelated to the expected keys
+    // (SPARK-59176). Its lookups miss either way, which is the answer for a side with nothing to
+    // contribute, so it pads out to the expected partitions instead of failing.
+    val emptyChild = DummySparkPlan(outputPartitioning = KeyedPartitioning(Seq(exprA), Nil))
+    val emptyGpe = GroupPartitionsExec(
+      emptyChild, expectedPartitionKeys = Some(Seq(longKey -> 2)), distributePartitions = true)
+    assert(emptyGpe.groupedPartitions.map(_._2) === Seq(Seq.empty, Seq.empty))
   }
 
   test("SPARK-56549: tryEnableSortedMerge returns None when no coalescing occurs") {

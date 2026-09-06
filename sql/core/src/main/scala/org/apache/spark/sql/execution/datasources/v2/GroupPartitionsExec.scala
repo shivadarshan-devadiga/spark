@@ -48,7 +48,11 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  *                         keys of a single-child operator. The name is historical, the projection
  *                         is not join-specific.
  * @param expectedPartitionKeys Optional sequence of expected partition key values and their
- *                              split counts
+ *                              split counts. The keys are looked up among this node's own projected
+ *                              and reduced keys, so they must carry those keys' types, and with
+ *                              `distributePartitions` a key's count must cover the splits this node
+ *                              holds for it -- otherwise the sides of the operation end up with
+ *                              different partition counts. `alignToExpectedKeys` checks both.
  * @param reducers Optional reducers to apply to partition keys for grouping compatibility
  * @param distributePartitions When true, splits for a key are distributed across the expected
  *                             partitions (padding with empty partitions). When false, all splits
@@ -128,12 +132,46 @@ case class GroupPartitionsExec(
   }
 
   /** Aligns partitions based on `expectedPartitionKeys` and clustering mode. */
-  private def alignToExpectedKeys(keyMap: Map[InternalRowComparableWrapper, Seq[Int]]) = {
+  private def alignToExpectedKeys(
+      keyMap: Map[InternalRowComparableWrapper, Seq[Int]],
+      dataTypes: Seq[DataType]) = {
+    val expected = expectedPartitionKeys.get
+    // The lookups below compare `InternalRowComparableWrapper`s, an equality that answers false on
+    // the data types alone before it compares a single value. Expected keys not typed like this
+    // node's keys would miss for every key and leave every partition empty, with no error and no
+    // rows, so fail here instead. All the keys of a partitioning share their types, so the first
+    // one answers for all of them.
+    //
+    // Only a node that holds keys is checked. `keyDataTypes` is a fact about the key rows, and with
+    // no key row it falls back to the expression types, which a reduce leaves unrelated to the keys
+    // so an empty side cannot answer the comparison. Its lookups miss either way, which is the
+    // right answer for a side with no partition to contribute.
+    if (keyMap.nonEmpty) {
+      expected.headOption.foreach { case (key, _) =>
+        if (key.dataTypes != dataTypes) {
+          throw SparkException.internalError("GroupPartitionsExec expected partition keys typed " +
+            s"${dataTypes.map(_.simpleString).mkString("[", ", ", "]")}, but they are typed " +
+            s"${key.dataTypes.map(_.simpleString).mkString("[", ", ", "]")}")
+        }
+      }
+    }
     var isGrouped = true
-    val alignedPartitions = expectedPartitionKeys.get.flatMap { case (key, numSplits) =>
+    val alignedPartitions = expected.flatMap { case (key, numSplits) =>
       if (numSplits > 1) isGrouped = false
       val splits = keyMap.getOrElse(key, Seq.empty)
       if (distributePartitions) {
+        // The count is what the sides of the operation agreed on: each lays its own splits out
+        // against the same counts, so both end up with the same number of partitions. `padTo` only
+        // pads, so a count below the number of splits this node holds for the key would quietly
+        // emit extra partitions here and leave the sides misaligned. The count comes from the
+        // other side's view of this one, which is derived rather than read off this node, so catch
+        // a wrong one here -- otherwise it surfaces as an unequal-partition-count failure from the
+        // zip below the operation, or as wrong results where only one side's partitioning shows.
+        if (splits.length > numSplits) {
+          throw SparkException.internalError(s"GroupPartitionsExec expected at most $numSplits " +
+            s"partition(s) for the partition key ${key.row}, but the child has " +
+            s"${splits.length} splits for it")
+        }
         // Distribute splits across expected partitions, padding with empty sequences
         val paddedSplits = splits.map(Seq(_)).padTo(numSplits, Seq.empty)
         paddedSplits.map((key, _))
@@ -190,7 +228,7 @@ case class GroupPartitionsExec(
     val keyToPartitionIndices = reducedKeys.zipWithIndex.groupMap(_._1)(_._2)
 
     val (partitions, isGrouped) = if (expectedPartitionKeys.isDefined) {
-      alignToExpectedKeys(keyToPartitionIndices)
+      alignToExpectedKeys(keyToPartitionIndices, reducedDataTypes)
     } else {
       (groupAndSortByKeys(keyToPartitionIndices, reducedDataTypes), true)
     }

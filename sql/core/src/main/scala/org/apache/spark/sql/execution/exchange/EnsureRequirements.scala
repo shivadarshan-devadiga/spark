@@ -690,6 +690,11 @@ case class EnsureRequirements(
                 .fold(originalKeyedPartitioning.partitionKeys)(
                   originalKeyedPartitioning.projectKeys(_)._2)
 
+              // The keys counted here are not reduced, because a reduce needs
+              // `KeyedShuffleSpec.canReduceKeys`, which is off whenever partial clustering is on,
+              // so `reducersBothWays` above answered `None` for both sides. Projecting is therefore
+              // enough to count what the distributing side really holds, which is what
+              // `GroupPartitionsExec.alignToExpectedKeys` checks these counts against.
               val numExpectedPartitions =
                 projectedOriginalPartitionKeys.groupBy(identity).view.mapValues(_.size)
 
