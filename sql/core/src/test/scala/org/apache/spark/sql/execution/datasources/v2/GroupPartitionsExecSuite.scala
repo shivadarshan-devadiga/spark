@@ -348,11 +348,10 @@ class GroupPartitionsExecSuite extends SharedSparkSession {
 
   test("SPARK-59234: a distributing node catches an expected partition key count " +
       "below its splits") {
-    // Key 1 holds two of the child's splits. `distributePartitions` lays those splits out over the
-    // count the two sides agreed on for the key, so a count of 1 does not describe this side: the
-    // padding is a no-op and the key would contribute two partitions while the replicating side
-    // contributes one, leaving the sides misaligned. The node has to catch that itself, since the
-    // count is derived from the other side's view of this one.
+    // Key 1 holds two of the child's splits. `padTo` only pads, so a count of 1 for it emits two
+    // partitions carrying that key while `isGrouped`, which is derived from the counts, still
+    // reports a grouped layout -- an inconsistency downstream reads as fact and only fails on
+    // several steps away (SPARK-58996).
     val child = DummySparkPlan(
       outputPartitioning = KeyedPartitioning(Seq(exprA), Seq(row(1), row(2), row(1))))
     def gpe(numSplitsForKey1: Int, distribute: Boolean): GroupPartitionsExec =
@@ -377,6 +376,16 @@ class GroupPartitionsExecSuite extends SharedSparkSession {
     // The replicating layout emits exactly the expected count for a key whatever its splits are,
     // so the check does not apply to it.
     assert(gpe(1, distribute = false).groupedPartitions.map(_._2) === Seq(Seq(0, 2), Seq(1)))
+
+    // With the count covering the splits, the counts `isGrouped` is derived from describe the
+    // layout that is emitted: a count above 1 repeats the key and reports non-grouped, and a count
+    // of 1 emits the key once -- coalescing its splits, in the replicating layout -- and reports
+    // grouped.
+    def isGrouped(numSplitsForKey1: Int, distribute: Boolean): Boolean =
+      gpe(numSplitsForKey1, distribute).outputPartitioning
+        .asInstanceOf[KeyedPartitioning].isGrouped
+    assert(!isGrouped(2, distribute = true))
+    assert(isGrouped(1, distribute = false))
   }
 
   test("SPARK-59234: a node catches expected partition keys that are not typed like its own") {

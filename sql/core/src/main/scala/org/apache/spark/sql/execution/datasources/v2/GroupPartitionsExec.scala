@@ -51,8 +51,8 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  *                              split counts. The keys are looked up among this node's own projected
  *                              and reduced keys, so they must carry those keys' types, and with
  *                              `distributePartitions` a key's count must cover the splits this node
- *                              holds for it -- otherwise the sides of the operation end up with
- *                              different partition counts. `alignToExpectedKeys` checks both.
+ *                              holds for it, since the counts are what `isGrouped` is derived from.
+ *                              `alignToExpectedKeys` checks both.
  * @param reducers Optional reducers to apply to partition keys for grouping compatibility
  * @param distributePartitions When true, splits for a key are distributed across the expected
  *                             partitions (padding with empty partitions). When false, all splits
@@ -160,13 +160,15 @@ case class GroupPartitionsExec(
       if (numSplits > 1) isGrouped = false
       val splits = keyMap.getOrElse(key, Seq.empty)
       if (distributePartitions) {
-        // The count is what the sides of the operation agreed on: each lays its own splits out
-        // against the same counts, so both end up with the same number of partitions. `padTo` only
-        // pads, so a count below the number of splits this node holds for the key would quietly
-        // emit extra partitions here and leave the sides misaligned. The count comes from the
-        // other side's view of this one, which is derived rather than read off this node, so catch
-        // a wrong one here -- otherwise it surfaces as an unequal-partition-count failure from the
-        // zip below the operation, or as wrong results where only one side's partitioning shows.
+        // `padTo` only pads, so a count below the number of splits this node holds for the key
+        // emits more partitions than the count declares, all carrying that key. `isGrouped` above
+        // is derived from the counts, so a count of 1 still reports a grouped layout and the
+        // emitted partitions contradict it. Downstream reads that report as fact -- `satisfies`
+        // for `ClusteredDistribution`, join pairing, shuffle-spec construction -- so the
+        // inconsistency surfaces well away from its cause: the SPARK-58996 review saw it as
+        // `PartitioningCollection.fromPartitionings` failing "All KeyedPartitionings in a
+        // PartitioningCollection must have equal partitionKeys" under
+        // `SortMergeJoinExec.outputPartitioning`. Fail at the node that owns the alignment instead.
         if (splits.length > numSplits) {
           throw SparkException.internalError(s"GroupPartitionsExec expected at most $numSplits " +
             s"partition(s) for the partition key ${key.row}, but the child has " +
