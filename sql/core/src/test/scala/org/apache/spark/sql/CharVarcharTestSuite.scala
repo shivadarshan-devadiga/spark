@@ -511,8 +511,9 @@ trait CharVarcharTestSuite extends QueryTest {
   test("SPARK-59278: char type IN list with a NULL ahead of the matching literal") {
     // A NULL element must not shift the literals that follow it. `c IN (null, 'a')` is TRUE
     // because one of the comparisons is TRUE, and NULL OR TRUE is TRUE. Both spellings of NULL
-    // are covered: an untyped NULL makes InConversion coerce every element of the IN, while a
-    // pre-typed one leaves the CHAR value untouched.
+    // are covered: an untyped NULL goes through InConversion, which casts only that NULL to the
+    // wider common type, while a pre-typed STRING NULL needs no coercion at all. The CHAR-backed
+    // value stays unchanged in both cases.
     val nulls = Seq("null", "cast(null as string)")
     val trueConditions = nulls.flatMap { n =>
       Seq(
